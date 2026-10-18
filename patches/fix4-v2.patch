@@ -1,0 +1,401 @@
+diff --git a/highs/mip/HighsDebugSol.cpp b/highs/mip/HighsDebugSol.cpp
+index 02dfa21242..323b2fb6d6 100644
+--- a/highs/mip/HighsDebugSol.cpp
++++ b/highs/mip/HighsDebugSol.cpp
+@@ -181,7 +181,8 @@ void HighsDebugSol::checkCut(const HighsInt* Rindex, const double* Rvalue,
+ 
+ void HighsDebugSol::checkRowAggregation(const HighsLp& lp,
+                                         const HighsInt* Rindex,
+-                                        const double* Rvalue, HighsInt Rlen) {
++                                        const double* Rvalue, HighsInt Rlen,
++                                        double rhs) {
+   if (!debugSolActive) return;
+   HighsCDouble violation = 0.0;
+ 
+@@ -197,7 +198,9 @@ void HighsDebugSol::checkRowAggregation(const HighsLp& lp,
+       violation += dbgSol.row_value[Rindex[i] - lp.num_col_] * Rvalue[i];
+   }
+ 
+-  double viol = fabs(double(violation));
++  // the aggregation is valid as an inequality with the (possibly relaxed)
++  // right hand side, see HighsLpAggregator::getCurrentAggregation
++  double viol = double(violation - rhs);
+ 
+   assert(viol <= mipsolver->mipdata_->feastol);
+ }
+diff --git a/highs/mip/HighsDebugSol.h b/highs/mip/HighsDebugSol.h
+index 2d26e14647..84a774349f 100644
+--- a/highs/mip/HighsDebugSol.h
++++ b/highs/mip/HighsDebugSol.h
+@@ -63,7 +63,7 @@ struct HighsDebugSol {
+                 double Rlower, double Rupper);
+ 
+   void checkRowAggregation(const HighsLp& lp, const HighsInt* Rindex,
+-                           const double* Rvalue, HighsInt Rlen);
++                           const double* Rvalue, HighsInt Rlen, double rhs);
+ 
+   void checkClique(const HighsCliqueTable::CliqueVar* clq, HighsInt clqlen);
+ 
+@@ -111,7 +111,7 @@ struct HighsDebugSol {
+                 double) const {}
+ 
+   void checkRowAggregation(const HighsLp&, const HighsInt*, const double*,
+-                           HighsInt) const {}
++                           HighsInt, double) const {}
+ 
+   void checkClique(const HighsCliqueTable::CliqueVar*, HighsInt) const {}
+ 
+diff --git a/highs/mip/HighsLpAggregator.cpp b/highs/mip/HighsLpAggregator.cpp
+index 97f51ee6ba..06edfe118e 100644
+--- a/highs/mip/HighsLpAggregator.cpp
++++ b/highs/mip/HighsLpAggregator.cpp
+@@ -9,11 +9,14 @@
+ #include "mip/HighsLpAggregator.h"
+ 
+ #include "mip/HighsLpRelaxation.h"
++#include "mip/HighsMipSolverData.h"
+ 
+ HighsLpAggregator::HighsLpAggregator(const HighsLpRelaxation& lprelaxation)
+     : lprelaxation(lprelaxation) {
+   vectorsum.setDimension(lprelaxation.getLp().num_row_ +
+                          lprelaxation.getLp().num_col_);
++  dropRelax[0] = 0.0;
++  dropRelax[1] = 0.0;
+ }
+ 
+ void HighsLpAggregator::addRow(HighsInt row, double weight) {
+@@ -29,20 +32,39 @@ void HighsLpAggregator::addRow(HighsInt row, double weight) {
+ 
+ void HighsLpAggregator::getCurrentAggregation(std::vector<HighsInt>& inds,
+                                               std::vector<double>& vals,
+-                                              bool negate) {
+-  const double droptol =
+-      lprelaxation.getMipSolver().options_mip_->small_matrix_value;
++                                              bool negate, double& rhs) {
++  const HighsMipSolver& mipsolver = lprelaxation.getMipSolver();
++  const double droptol = mipsolver.options_mip_->small_matrix_value;
+   const HighsInt numCol = lprelaxation.numCols();
+-  vectorsum.cleanup([droptol, numCol](HighsInt col, double val) {
++  const HighsDomain& globaldom = mipsolver.mipdata_->getDomain();
++  vectorsum.cleanup([&](HighsInt col, double val) {
+     // only drop values for columns and not for slack variables of rows as the
+     // former are the only ones which might be subject to numerical error. The
+     // values for row slack variables are exact copies of the weights used
+     // (assuming that separators only add each row once). Also all the
+     // separators will only allow rows that do have meaningful coefficient
+     // contributions with the used weight
+-    return col < numCol && std::fabs(val) <= droptol;
++    if (col >= numCol || std::fabs(val) > droptol) return false;
++    // The aggregation is an equation with right hand side 0. Dropping the
++    // term val * x_col is only valid if the right hand side is relaxed by the
++    // largest value the term can take with the opposite sign, which needs
++    // both global bounds to be finite (one for each direction). Otherwise
++    // keep the term.
++    const double lb = globaldom.col_lower_[col];
++    const double ub = globaldom.col_upper_[col];
++    if (lb == -kHighsInf || ub == kHighsInf) return false;
++    if (val > 0) {
++      dropRelax[0] -= val * lb;
++      dropRelax[1] += val * ub;
++    } else {
++      dropRelax[0] -= val * ub;
++      dropRelax[1] += val * lb;
++    }
++    return true;
+   });
+ 
++  rhs = double(dropRelax[negate ? 1 : 0]);
++
+   inds = vectorsum.getNonzeros();
+   HighsInt len = inds.size();
+   vals.resize(len);
+@@ -53,4 +75,8 @@ void HighsLpAggregator::getCurrentAggregation(std::vector<HighsInt>& inds,
+     for (HighsInt i = 0; i != len; ++i) vals[i] = vectorsum.getValue(inds[i]);
+ }
+ 
+-void HighsLpAggregator::clear() { vectorsum.clear(); }
++void HighsLpAggregator::clear() {
++  vectorsum.clear();
++  dropRelax[0] = 0.0;
++  dropRelax[1] = 0.0;
++}
+diff --git a/highs/mip/HighsLpAggregator.h b/highs/mip/HighsLpAggregator.h
+index 731351db12..0c7f50cac0 100644
+--- a/highs/mip/HighsLpAggregator.h
++++ b/highs/mip/HighsLpAggregator.h
+@@ -17,6 +17,7 @@
+ #include <cstdint>
+ #include <vector>
+ 
++#include "util/HighsCDouble.h"
+ #include "util/HighsSparseVectorSum.h"
+ 
+ class HighsLpRelaxation;
+@@ -29,6 +30,12 @@ class HighsLpAggregator {
+ 
+   HighsSparseVectorSum vectorsum;
+ 
++  /// Relaxation of the right hand side caused by dropping tiny column
++  /// coefficients during cleanup, for the plain [0] and negated [1]
++  /// aggregation. Cleanup permanently removes the terms from vectorsum, so the
++  /// relaxation is accumulated across cleanups until clear() is called.
++  HighsCDouble dropRelax[2];
++
+  public:
+   HighsLpAggregator(const HighsLpRelaxation& lprelaxation);
+ 
+@@ -36,9 +43,13 @@ class HighsLpAggregator {
+   void addRow(HighsInt row, double weight);
+ 
+   /// returns the current aggregation of LP rows. The aggregation includes slack
+-  /// variables so that it is always an equation with right hand side 0.
++  /// variables so that it is an equation with right hand side 0. Tiny column
++  /// coefficients are dropped only for columns with finite global bounds, and
++  /// the returned rhs is relaxed accordingly, so that the returned row
++  /// sum_j vals[j] x_{inds[j]} <= rhs is valid for the global domain.
+   void getCurrentAggregation(std::vector<HighsInt>& inds,
+-                             std::vector<double>& vals, bool negate);
++                             std::vector<double>& vals, bool negate,
++                             double& rhs);
+ 
+   /// clear the current aggregation
+   void clear();
+diff --git a/highs/mip/HighsModkSeparator.cpp b/highs/mip/HighsModkSeparator.cpp
+index b1de06cab7..02fac089ed 100644
+--- a/highs/mip/HighsModkSeparator.cpp
++++ b/highs/mip/HighsModkSeparator.cpp
+@@ -220,9 +220,10 @@ void HighsModkSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+       lpAggregator.addRow(row, weight);
+     }
+ 
+-    lpAggregator.getCurrentAggregation(inds, vals, false);
++    lpAggregator.getCurrentAggregation(inds, vals, false, rhs);
++    mipsolver.mipdata_->debugSolution.checkRowAggregation(
++        lpRelaxation.getLp(), inds.data(), vals.data(), inds.size(), rhs);
+ 
+-    rhs = 0.0;
+     cutGen.generateCut(transLp, inds, vals, rhs, true);
+ 
+     if (k != 2) {
+@@ -234,9 +235,10 @@ void HighsModkSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+       }
+     }
+ 
+-    lpAggregator.getCurrentAggregation(inds, vals, true);
++    lpAggregator.getCurrentAggregation(inds, vals, true, rhs);
++    mipsolver.mipdata_->debugSolution.checkRowAggregation(
++        lpRelaxation.getLp(), inds.data(), vals.data(), inds.size(), rhs);
+ 
+-    rhs = 0.0;
+     cutGen.generateCut(transLp, inds, vals, rhs, true);
+ 
+     lpAggregator.clear();
+diff --git a/highs/mip/HighsPathSeparator.cpp b/highs/mip/HighsPathSeparator.cpp
+index bc6f01f485..ed83ce3e1a 100644
+--- a/highs/mip/HighsPathSeparator.cpp
++++ b/highs/mip/HighsPathSeparator.cpp
+@@ -171,6 +171,9 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+   HighsInt currentPath[maxPathLen];
+   std::vector<std::pair<std::vector<HighsInt>, std::vector<double>>>
+       aggregatedPath;
++  // right hand sides of the rows in aggregatedPath (relaxed for dropped tiny
++  // coefficients, see HighsLpAggregator::getCurrentAggregation)
++  std::vector<double> aggregatedPathRhs;
+   std::array<double, 2> scales;
+   for (HighsInt i = 0; i != lp.num_row_; ++i) {
+     switch (rowtype[i]) {
+@@ -294,9 +297,12 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+           };
+ 
+       aggregatedPath.clear();
++      aggregatedPathRhs.clear();
+ 
+       while (currPathLen != maxPathLen) {
+-        lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, false);
++        double rhs;
++        lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, false,
++                                           rhs);
+         HighsInt baseRowLen = baseRowInds.size();
+         bool addedSubstitutionRows = false;
+ 
+@@ -314,6 +320,15 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+               lpRelaxation.isColIntegral(col))
+             continue;
+ 
++          // Never substitute out a column whose coefficient is only round-off
++          // (e.g. left by an earlier substitution of the same column but kept
++          // because the column has an infinite bound): the round-off of the
++          // substitution would remain and the same row would be added again
++          // forever.
++          if (std::fabs(baseRowVals[j]) <=
++              mip.options_mip_->small_matrix_value)
++            continue;
++
+           if (colSubstitutions[col].first != -1) {
+             addedSubstitutionRows = true;
+             lpAggregator.addRow(colSubstitutions[col].first,
+@@ -349,16 +364,23 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+         if (addedSubstitutionRows) continue;
+ 
+         // generate cut
+-        double rhs = 0;
++        mip.mipdata_->debugSolution.checkRowAggregation(
++            lp, baseRowInds.data(), baseRowVals.data(), baseRowInds.size(),
++            rhs);
+         success = cutGen.generateCut(transLp, baseRowInds, baseRowVals, rhs);
+ 
+-        lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, true);
++        lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, true,
++                                           rhs);
++        mip.mipdata_->debugSolution.checkRowAggregation(
++            lp, baseRowInds.data(), baseRowVals.data(), baseRowInds.size(),
++            rhs);
+         if (!aggregatedPath.empty() || bestOutArcCol != -1 ||
+-            bestInArcCol != -1)
++            bestInArcCol != -1) {
+           aggregatedPath.emplace_back(baseRowInds, baseRowVals);
++          aggregatedPathRhs.push_back(rhs);
++        }
+ 
+         // generate reverse cut
+-        rhs = 0;
+         success |= cutGen.generateCut(transLp, baseRowInds, baseRowVals, rhs);
+ 
+         if (success || (bestOutArcCol == -1 && bestInArcCol == -1)) break;
+@@ -416,6 +438,7 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+ 
+         for (HighsInt k = 0; k < pathLen; ++k) {
+           bool integralPositive = false;
++          rhs[k] = aggregatedPathRhs[k];
+ 
+           if (!transLp.transform(aggregatedPath[k].second, tmpUpper, tmpSolval,
+                                  aggregatedPath[k].first, rhs[k],
+diff --git a/highs/mip/HighsTableauSeparator.cpp b/highs/mip/HighsTableauSeparator.cpp
+index fa58ef2c7e..f118aa9a21 100644
+--- a/highs/mip/HighsTableauSeparator.cpp
++++ b/highs/mip/HighsTableauSeparator.cpp
+@@ -200,7 +200,8 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+     for (const auto& rowWeight : fracvar.row_ep)
+       lpAggregator.addRow(rowWeight.first, rowWeight.second);
+ 
+-    lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, false);
++    double rhs;
++    lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, false, rhs);
+ 
+     if (10 * (baseRowInds.size() - fracvar.row_ep.size()) >
+         10000 + static_cast<size_t>(mip.numCol())) {
+@@ -213,7 +214,13 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+       double maxAbsVal = 0.0;
+       double minAbsVal = kHighsInf;
+       for (HighsInt i = 0; i < len; ++i) {
+-        if (baseRowInds[i] < mip.numCol()) {
++        // Coefficients up to small_matrix_value are round-off kept by the
++        // aggregator only because the column has an infinite bound (see
++        // HighsLpAggregator::getCurrentAggregation). Cut generation removes
++        // them, relaxing the rhs by the bound needed for each direction, or
++        // rejects that direction, so they do not count towards the dynamism.
++        if (baseRowInds[i] < mip.numCol() &&
++            std::abs(baseRowVals[i]) > mip.options_mip_->small_matrix_value) {
+           maxAbsVal = std::max(std::abs(baseRowVals[i]), maxAbsVal);
+           minAbsVal = std::min(std::abs(baseRowVals[i]), minAbsVal);
+         }
+@@ -226,14 +233,15 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+ 
+     mip.mipdata_->debugSolution.checkRowAggregation(
+         lpSolver.getLp(), baseRowInds.data(), baseRowVals.data(),
+-        baseRowInds.size());
++        baseRowInds.size(), rhs);
+ 
+-    double rhs = 0;
+     cutGen.generateCut(transLp, baseRowInds, baseRowVals, rhs);
+     if (transLp.getGlobaldom().infeasible()) break;
+ 
+-    lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, true);
+-    rhs = 0;
++    lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, true, rhs);
++    mip.mipdata_->debugSolution.checkRowAggregation(
++        lpSolver.getLp(), baseRowInds.data(), baseRowVals.data(),
++        baseRowInds.size(), rhs);
+     cutGen.generateCut(transLp, baseRowInds, baseRowVals, rhs);
+     if (transLp.getGlobaldom().infeasible()) break;
+ 
+diff --git a/highs/mip/HighsTransformedLp.cpp b/highs/mip/HighsTransformedLp.cpp
+index 873f7da1b9..337f7a9e52 100644
+--- a/highs/mip/HighsTransformedLp.cpp
++++ b/highs/mip/HighsTransformedLp.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "mip/HighsTransformedLp.h"
+ 
++#include <algorithm>
++
+ #include "mip/HighsMipSolverData.h"
+ #include "util/HighsCDouble.h"
+ #include "util/HighsIntegers.h"
+@@ -372,14 +374,49 @@ bool HighsTransformedLp::transform(std::vector<double>& vals,
+       if (vals[i] != 0.0) vectorsum.add(inds[i], vals[i]);
+     }
+ 
+-    double maxError = 0.0;
++    // Columns still in the row whose bound type is a variable bound now
++    // stand for the slack of that variable bound constraint (>= 0, at most
++    // ub - lb); all other entries are columns in the original space.
++    std::vector<HighsInt> vbdSlacks;
++    for (HighsInt k = 0; k != numNz; ++k) {
++      if (vals[k] == 0.0) continue;
++      BoundType bt = boundTypes[inds[k]];
++      if (bt == BoundType::kVariableLb || bt == BoundType::kVariableUb)
++        vbdSlacks.push_back(inds[k]);
++    }
++    std::sort(vbdSlacks.begin(), vbdSlacks.end());
++
++    // Drop tiny coefficients only after relaxing the right-hand side by the
++    // largest value the dropped term can take (as in untransform); give up if
++    // that needs an infinite bound.
++    bool abort = false;
+     auto IsZero = [&](HighsInt col, double val) {
+-      if (std::abs(val) <= mip.options_mip_->small_matrix_value) return true;
+-      return false;
++      if (std::abs(val) > mip.options_mip_->small_matrix_value) return false;
++      double lb = getLb(col);
++      double ub = getUb(col);
++      if (std::binary_search(vbdSlacks.begin(), vbdSlacks.end(), col)) {
++        if (val < 0) {
++          if (ub == kHighsInf || lb == -kHighsInf)
++            abort = true;
++          else
++            tmpRhs -= val * (ub - lb);
++        }
++      } else if (val > 0) {
++        if (lb == -kHighsInf)
++          abort = true;
++        else
++          tmpRhs -= val * lb;
++      } else {
++        if (ub == kHighsInf)
++          abort = true;
++        else
++          tmpRhs -= val * ub;
++      }
++      return true;
+     };
+ 
+     vectorsum.cleanup(IsZero);
+-    if (maxError > mip.mipdata_->feastol) {
++    if (abort) {
+       vectorsum.clear();
+       return false;
+     }
+@@ -576,8 +613,10 @@ bool HighsTransformedLp::untransform(std::vector<double>& vals,
+     auto IsZero = [&](HighsInt col, double val) {
+       assert(col < mip.numCol());
+       double absval = std::abs(val);
+-      if (absval <= mip.options_mip_->small_matrix_value) return true;
+-
++      // Drop tiny coefficients only after relaxing the right-hand side by
++      // val * bound, as for any coefficient up to feastol. Dropping one
++      // without relaxing tightens the cut by |val| * |bound|, which for a
++      // large bound can cut off feasible (even optimal) solutions (#3434).
+       if (absval <= mip.mipdata_->feastol) {
+         if (val > 0) {
+           if (globaldom_.col_lower_[col] == -kHighsInf)

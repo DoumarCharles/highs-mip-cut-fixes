@@ -1,0 +1,152 @@
+diff --git a/highs/mip/HighsLpAggregator.cpp b/highs/mip/HighsLpAggregator.cpp
+index 97f51ee6ba..e5dd7ce5bc 100644
+--- a/highs/mip/HighsLpAggregator.cpp
++++ b/highs/mip/HighsLpAggregator.cpp
+@@ -30,17 +30,20 @@ void HighsLpAggregator::addRow(HighsInt row, double weight) {
+ void HighsLpAggregator::getCurrentAggregation(std::vector<HighsInt>& inds,
+                                               std::vector<double>& vals,
+                                               bool negate) {
+-  const double droptol =
+-      lprelaxation.getMipSolver().options_mip_->small_matrix_value;
+   const HighsInt numCol = lprelaxation.numCols();
+-  vectorsum.cleanup([droptol, numCol](HighsInt col, double val) {
+-    // only drop values for columns and not for slack variables of rows as the
+-    // former are the only ones which might be subject to numerical error. The
+-    // values for row slack variables are exact copies of the weights used
+-    // (assuming that separators only add each row once). Also all the
+-    // separators will only allow rows that do have meaningful coefficient
+-    // contributions with the used weight
+-    return col < numCol && std::fabs(val) <= droptol;
++  vectorsum.cleanup([numCol](HighsInt col, double val) {
++    // Only remove exact zeros, and only for columns: values for row slack
++    // variables are exact copies of the weights used (assuming that separators
++    // only add each row once). Small nonzero column values (round-off from
++    // cancellations) are kept so that the aggregation stays an equation with
++    // right hand side 0. Dropping a term a_j x_j here would need the right
++    // hand side to be relaxed by a_j times a bound of x_j, and with large
++    // bounds the error from dropping it without relaxing exceeds feastol, so
++    // that cuts derived from the aggregation can cut off feasible solutions.
++    // Cut generation removes small coefficients itself, relaxing the right
++    // hand side with the bound needed for the direction of the cut (and in
++    // the transformed space, where this costs at most the bound range).
++    return col < numCol && val == 0.0;
+   });
+ 
+   inds = vectorsum.getNonzeros();
+diff --git a/highs/mip/HighsPathSeparator.cpp b/highs/mip/HighsPathSeparator.cpp
+index bc6f01f485..4fc75978ac 100644
+--- a/highs/mip/HighsPathSeparator.cpp
++++ b/highs/mip/HighsPathSeparator.cpp
+@@ -314,6 +314,14 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+               lpRelaxation.isColIntegral(col))
+             continue;
+ 
++          // Never substitute out a column whose coefficient is only round-off
++          // (e.g. left by an earlier substitution of the same column, which
++          // the aggregator keeps): the round-off of the substitution would
++          // remain and the same row would be added again forever.
++          if (std::fabs(baseRowVals[j]) <=
++              mip.options_mip_->small_matrix_value)
++            continue;
++
+           if (colSubstitutions[col].first != -1) {
+             addedSubstitutionRows = true;
+             lpAggregator.addRow(colSubstitutions[col].first,
+diff --git a/highs/mip/HighsTableauSeparator.cpp b/highs/mip/HighsTableauSeparator.cpp
+index fa58ef2c7e..7575f104e0 100644
+--- a/highs/mip/HighsTableauSeparator.cpp
++++ b/highs/mip/HighsTableauSeparator.cpp
+@@ -213,7 +213,12 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
+       double maxAbsVal = 0.0;
+       double minAbsVal = kHighsInf;
+       for (HighsInt i = 0; i < len; ++i) {
+-        if (baseRowInds[i] < mip.numCol()) {
++        // Coefficients up to small_matrix_value are round-off which the
++        // aggregator keeps (see HighsLpAggregator::getCurrentAggregation).
++        // Cut generation removes them with the proper relaxation of the right
++        // hand side, so they do not count towards the dynamism of the row.
++        if (baseRowInds[i] < mip.numCol() &&
++            std::abs(baseRowVals[i]) > mip.options_mip_->small_matrix_value) {
+           maxAbsVal = std::max(std::abs(baseRowVals[i]), maxAbsVal);
+           minAbsVal = std::min(std::abs(baseRowVals[i]), minAbsVal);
+         }
+diff --git a/highs/mip/HighsTransformedLp.cpp b/highs/mip/HighsTransformedLp.cpp
+index 873f7da1b9..337f7a9e52 100644
+--- a/highs/mip/HighsTransformedLp.cpp
++++ b/highs/mip/HighsTransformedLp.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "mip/HighsTransformedLp.h"
+ 
++#include <algorithm>
++
+ #include "mip/HighsMipSolverData.h"
+ #include "util/HighsCDouble.h"
+ #include "util/HighsIntegers.h"
+@@ -372,14 +374,49 @@ bool HighsTransformedLp::transform(std::vector<double>& vals,
+       if (vals[i] != 0.0) vectorsum.add(inds[i], vals[i]);
+     }
+ 
+-    double maxError = 0.0;
++    // Columns still in the row whose bound type is a variable bound now
++    // stand for the slack of that variable bound constraint (>= 0, at most
++    // ub - lb); all other entries are columns in the original space.
++    std::vector<HighsInt> vbdSlacks;
++    for (HighsInt k = 0; k != numNz; ++k) {
++      if (vals[k] == 0.0) continue;
++      BoundType bt = boundTypes[inds[k]];
++      if (bt == BoundType::kVariableLb || bt == BoundType::kVariableUb)
++        vbdSlacks.push_back(inds[k]);
++    }
++    std::sort(vbdSlacks.begin(), vbdSlacks.end());
++
++    // Drop tiny coefficients only after relaxing the right-hand side by the
++    // largest value the dropped term can take (as in untransform); give up if
++    // that needs an infinite bound.
++    bool abort = false;
+     auto IsZero = [&](HighsInt col, double val) {
+-      if (std::abs(val) <= mip.options_mip_->small_matrix_value) return true;
+-      return false;
++      if (std::abs(val) > mip.options_mip_->small_matrix_value) return false;
++      double lb = getLb(col);
++      double ub = getUb(col);
++      if (std::binary_search(vbdSlacks.begin(), vbdSlacks.end(), col)) {
++        if (val < 0) {
++          if (ub == kHighsInf || lb == -kHighsInf)
++            abort = true;
++          else
++            tmpRhs -= val * (ub - lb);
++        }
++      } else if (val > 0) {
++        if (lb == -kHighsInf)
++          abort = true;
++        else
++          tmpRhs -= val * lb;
++      } else {
++        if (ub == kHighsInf)
++          abort = true;
++        else
++          tmpRhs -= val * ub;
++      }
++      return true;
+     };
+ 
+     vectorsum.cleanup(IsZero);
+-    if (maxError > mip.mipdata_->feastol) {
++    if (abort) {
+       vectorsum.clear();
+       return false;
+     }
+@@ -576,8 +613,10 @@ bool HighsTransformedLp::untransform(std::vector<double>& vals,
+     auto IsZero = [&](HighsInt col, double val) {
+       assert(col < mip.numCol());
+       double absval = std::abs(val);
+-      if (absval <= mip.options_mip_->small_matrix_value) return true;
+-
++      // Drop tiny coefficients only after relaxing the right-hand side by
++      // val * bound, as for any coefficient up to feastol. Dropping one
++      // without relaxing tightens the cut by |val| * |bound|, which for a
++      // large bound can cut off feasible (even optimal) solutions (#3434).
+       if (absval <= mip.mipdata_->feastol) {
+         if (val > 0) {
+           if (globaldom_.col_lower_[col] == -kHighsInf)
